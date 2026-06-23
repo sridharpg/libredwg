@@ -1,0 +1,64 @@
+diff --git a/src/common.h b/src/common.h
+index 82ebf855..11a1d935 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -627,11 +627,21 @@ void *memmem (const void *h0, size_t k, const void *n0, size_t l)
+ #endif
+ 
+ // push to handle vector at the end. It really is unshift.
++// floor-planner patch: grow the vector geometrically (capacity rounded up to a
++// power of two) instead of reallocating by +1 on every push. Appending N items
++// to one block was O(N^2) (each push copied the whole array), which made
++// build_dwg quadratic for large floor plans. Rounding to a power of two never
++// under-allocates, and realloc to the unchanged size is a no-op, so this stays
++// safe for any caller while making bulk appends amortized O(1).
+ #define PUSH_HV(_obj, numfield, hvfield, ref)                                 \
+   if (_obj->numfield <= 0 || _obj->hvfield[_obj->numfield - 1] != ref)        \
+     {                                                                         \
++      BITCODE_BL _hvneed = (BITCODE_BL)_obj->numfield + 1;                    \
++      BITCODE_BL _hvcap = 1;                                                  \
++      while (_hvcap < _hvneed)                                                \
++        _hvcap <<= 1;                                                         \
+       _obj->hvfield = (BITCODE_H *)realloc (                                  \
+-          _obj->hvfield, (_obj->numfield + 1) * sizeof (BITCODE_H));          \
++          _obj->hvfield, _hvcap * sizeof (BITCODE_H));                        \
+       _obj->hvfield[_obj->numfield] = ref;                                    \
+       LOG_TRACE ("%s[%d] = " FORMAT_REF " [H]\n", #hvfield, _obj->numfield,   \
+                  ARGS_REF (_obj->hvfield[_obj->numfield]));                   \
+diff --git a/src/dwg.c b/src/dwg.c
+index 22f7cc58..e4111b99 100644
+--- a/src/dwg.c
++++ b/src/dwg.c
+@@ -57,6 +57,14 @@ static bool env_var_checked_p;
+ #define DWG_LOGLEVEL loglevel
+ #include "logging.h"
+ 
++/* floor-planner patch: when set, dwg_add_handleref skips the handle-ref dedup
++   (ordered_ref_find / ordered_ref_add). Maintaining the sorted ref set is O(n)
++   per ref (sorted-array memmove insert), so bulk-building a document via
++   dwg_add_* was O(n^2). Duplicate refs are harmless for output (they resolve to
++   the same handle), so build_dwg sets this for a near-linear build. Default 0 =
++   stock behavior for decode/import. */
++int libredwg_skip_ref_dedup = 0;
++
+ /*------------------------------------------------------------------------------
+  * Imports bypassing its headers.
+  * We dont want to import in_dxf.h as it is redefining FORMAT_BD.
+@@ -2214,7 +2222,7 @@ dwg_add_handleref (Dwg_Data *restrict dwg, const BITCODE_RC code,
+                || (obj->fixedtype > DWG_TYPE_GROUP
+                    && obj->fixedtype != DWG_TYPE_DICTIONARYVAR)))))
+     ;
+-  else if (dwg->header.from_version > R_12 || absref)
++  else if ((dwg->header.from_version > R_12 || absref) && !libredwg_skip_ref_dedup)
+     {
+       // search of this code-absref pair already exists
+       // lsearch is slow,use bsearch
+@@ -3978,6 +3986,8 @@ void
+ ordered_ref_add (Dwg_Data *dwg, Dwg_Object_Ref *ref)
+ {
+   Dwg_Object_Ref **pBefore = NULL;
++  if (libredwg_skip_ref_dedup) /* floor-planner: skip O(n) sorted insert */
++    return;
+   Dwg_Object_Ref **pFound = NULL;
+   if (DWG_HDL_OWNER != ref->handleref.code
+       && DWG_HDL_SOFTOWN != ref->handleref.code

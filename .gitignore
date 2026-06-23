@@ -235,3 +235,8 @@ compile_commands.json
 /minisign.pub
 # temp patches
 /*.p
+
+# floor-planner WASM build (wasm/build.sh)
+/build-wasm/
+/wasm/embin/
+.DS_Store

@@ -13,7 +13,12 @@ in distinct blocks and rejects some valid DXF, e.g. MTEXT code 50).
 ## Layout
 - `build_dwg.c` — the wrapper compiled into the module (the only `.c` we add).
 - `build.sh` — self-locating build → `wasm/dist/{libredwg.mjs,libredwg.wasm}`.
-- `verify-dimension.mjs` — post-build smoke test (Node).
+- `tests/` — Node post-build checks (load `wasm/dist/`):
+  - `verify-dimension.mjs` — aligned DIMENSION round-trips with its override text.
+  - `verify-color.mjs` — layer/entity true color (420) + MTEXT attach/pos survive.
+  - `test-build.mjs` — exports present; LINE/PLINE/CIRCLE/ARC/TEXT/MTEXT round-trip.
+  - `test-scale.mjs N` — build N booths; reports build_dwg wall time (O(n²) check).
+  - `test-import-parity.mjs file.dwg` — DWG→DXF import diff vs a reference module.
 - `libredwg-on2-fix.patch` — reference copy of the O(n²) fix (already applied to
   `src/` on this branch; keep it to re-apply after an upstream rebase).
 - `embin/` — local emcc wrappers that force python ≥3.10 (git-ignored, per-machine).
@@ -40,6 +45,9 @@ STRIP_STRINGS=1 ./wasm/build.sh   # also drop error/warn strings (smaller, no di
 `.env` + `configure-em.sh` + `link-em.sh` split). It links at `-Oz` +
 `MinSizeRel` + `-DDISABLE_LOGGING`. Exports: `build_dwg`, `libredwg_dwg2dxf`,
 `libredwg_dxf2dwg`, `libredwg_version` (+ `malloc`/`free`, FS/ccall runtime).
+
+After building, sanity-check with `node wasm/tests/verify-dimension.mjs`
+(and the other scripts in `tests/`).
 
 ### Deploy to floor-planner
 ```sh

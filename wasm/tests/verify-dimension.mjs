@@ -1,7 +1,7 @@
 /* Post-build smoke test for the build_dwg superset, focused on DIMENSION support.
  *
  * Run AFTER ./wasm/build.sh:
- *   node wasm/verify-dimension.mjs
+ *   node wasm/tests/verify-dimension.mjs
  * (any Node >= 18; needs ESM + top-level await). Loads the freshly built module
  * from wasm/dist/.
  *
@@ -14,7 +14,7 @@ import { dirname, resolve } from 'node:path';
 import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const wasmDir = resolve(here, 'dist');
+const wasmDir = resolve(here, '..', 'dist');
 const moduleUrl = pathToFileURL(resolve(wasmDir, 'libredwg.mjs')).href;
 
 const createLibreDWG = (await import(moduleUrl)).default;

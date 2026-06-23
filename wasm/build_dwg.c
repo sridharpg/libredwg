@@ -27,11 +27,12 @@
  *       HATCHP <li> <aci> <name:lenstr> <ndef>
  *                [<angleDeg> bx by ox oy <ndash> <dash>*ndash]*ndef
  *                <nloops> [<npts> (x y)*npts]*nloops   ; patterned (line) fill
- *       DIM    <li> <aci> x1 y1 x2 y2 tx ty meas attach <text:lenstr>
- *                                       ; aligned DIMENSION: (x1,y1)/(x2,y2) =
- *                                       ; extension-line origins, (tx,ty) =
+ *       DIM    <li> <aci> x1 y1 x2 y2 tx ty meas attach rotdeg <text:lenstr>
+ *                                       ; rotated/linear DIMENSION: (x1,y1)/(x2,y2)
+ *                                       ; = extension-line origins, (tx,ty) =
  *                                       ; text + dim-line point, meas = DXF 42,
- *                                       ; attach = DXF 71 (1..9), text = DXF 1
+ *                                       ; attach = DXF 71 (1..9), rotdeg = DXF 50
+ *                                       ; dim-line angle (deg), text = DXF 1
  *                                       ; override label. Standard dimstyle auto-
  *                                       ; linked; no baked graphics block.
  *   END
@@ -414,28 +415,41 @@ int build_dwg (const char *in_path, const char *out_path, const char *version) {
       set_common (dwg, e, lref, col);
     }
     else if (!strcmp (t, "DIM")) {
-      /* DIM <li> <color> x1 y1 x2 y2 tx ty meas attach <text:lenstr>
-         A real aligned DIMENSION: (x1,y1)/(x2,y2) are the two extension-line
+      /* DIM <li> <color> x1 y1 x2 y2 tx ty meas attach rotdeg <text:lenstr>
+         A rotated/linear DIMENSION: (x1,y1)/(x2,y2) are the two extension-line
          origins, (tx,ty) is the text + dimension-line point, meas is the
          measured length (DXF 42), attach is the text attachment (DXF 71, 1..9),
-         and text is the override label shown verbatim (DXF 1).
-         dwg_add_DIMENSION_ALIGNED ensures a Standard DIMSTYLE and links its
-         handle (via DIMENSION_DEFAULTS), so there is no dangling dimstyle ref.
-         No anonymous *D graphics block is baked — the CAD app regenerates the
-         dimension drawing from the definition + dimstyle. */
+         rotdeg is the dimension-line angle in degrees (DXF 50), and text is the
+         override label shown verbatim (DXF 1).
+         The angle is the editor's dimension orientation: a horizontal/vertical/
+         oblique dimension whose two measured points are not themselves parallel
+         to that orientation must keep the orientation. dwg_add_DIMENSION_ALIGNED
+         can't express that (it derives the angle from x1->x2), so use
+         dwg_add_DIMENSION_LINEAR, which carries an explicit dim_rotation — this
+         matches the DXF writer's AcDbRotatedDimension (group 50). It ensures a
+         Standard DIMSTYLE and links its handle (via DIMENSION_DEFAULTS), so
+         there is no dangling dimstyle ref. No anonymous *D graphics block is
+         baked — the CAD app regenerates the drawing from the definition. */
       dwg_point_3d x1, x2, tm;
       x1.x = tok_dbl (&c); x1.y = tok_dbl (&c); x1.z = 0;
       x2.x = tok_dbl (&c); x2.y = tok_dbl (&c); x2.z = 0;
       tm.x = tok_dbl (&c); tm.y = tok_dbl (&c); tm.z = 0;
       double meas = tok_dbl (&c);
       int att = (int) tok_int (&c);
+      double rot = DEG2RAD (tok_dbl (&c));
+      /* normalize to [-PI, PI]: dwg_add_DIMENSION_LINEAR rejects |rot| > 12. */
+      while (rot > M_PI) rot -= 2.0 * M_PI;
+      while (rot < -M_PI) rot += 2.0 * M_PI;
       char *s = tok_lenstr (&c);
-      Dwg_Entity_DIMENSION_ALIGNED *e = dwg_add_DIMENSION_ALIGNED (hdr, &x1, &x2, &tm);
+      /* (tx,ty) is the dimension-line definition point (4th arg): the dim line
+         runs through it at `rot`, with extension lines dropped from x1/x2. */
+      Dwg_Entity_DIMENSION_LINEAR *e
+          = dwg_add_DIMENSION_LINEAR (hdr, &x1, &x2, &tm, rot);
       if (e) {
-        /* dimension-line definition point (DXF 10): put it on the text point so
-           the dimension line runs through the label (matches the DXF writer,
-           which sets 10 = 11 = text position). */
-        e->def_pt.x = tm.x; e->def_pt.y = tm.y; e->def_pt.z = 0;
+        /* text point (DXF 11) on the dim-line point (matches the DXF writer,
+           which sets 10 = 11 = text position). def_pt (DXF 10) is already set
+           to tm by the constructor. */
+        e->text_midpt.x = tm.x; e->text_midpt.y = tm.y;
         e->act_measurement = meas;
         if (att >= 1 && att <= 9) e->attachment = (BITCODE_BS) att;
         /* override text (DXF 1) shown verbatim; dwg_free releases the T string. */

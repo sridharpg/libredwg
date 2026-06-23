@@ -95,6 +95,27 @@ EXPORT void log_text32 (const unsigned int minlevel, const BITCODE_TU wstr);
     })
 #endif
 
+// strip all trace/info logging at compile time (keeps LOG_ERROR/LOG_WARN),
+// e.g. for size-constrained wasm builds
+#ifdef DISABLE_LOGGING
+#  undef DWG_LOGLEVEL
+#  define DWG_LOGLEVEL DWG_LOGLEVEL_NONE
+#  undef LOG
+#  define LOG(...)                                                            \
+    ({                                                                        \
+    })
+#  ifdef DISABLE_LOGGING_ALL
+#    undef LOG_ERROR
+#    define LOG_ERROR(...)                                                    \
+      ({                                                                      \
+      })
+#    undef LOG_WARN
+#    define LOG_WARN(...)                                                     \
+      ({                                                                      \
+      })
+#  endif
+#endif
+
 #define LOG_INFO(...) LOG (INFO, __VA_ARGS__)
 #define LOG_TRACE(...) LOG (TRACE, __VA_ARGS__)
 #define LOG_HANDLE(...) LOG (HANDLE, __VA_ARGS__)

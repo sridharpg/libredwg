@@ -627,11 +627,21 @@ void *memmem (const void *h0, size_t k, const void *n0, size_t l)
 #endif
 
 // push to handle vector at the end. It really is unshift.
+// floor-planner patch: grow the vector geometrically (capacity rounded up to a
+// power of two) instead of reallocating by +1 on every push. Appending N items
+// to one block was O(N^2) (each push copied the whole array), which made
+// build_dwg quadratic for large floor plans. Rounding to a power of two never
+// under-allocates, and realloc to the unchanged size is a no-op, so this stays
+// safe for any caller while making bulk appends amortized O(1).
 #define PUSH_HV(_obj, numfield, hvfield, ref)                                 \
   if (_obj->numfield <= 0 || _obj->hvfield[_obj->numfield - 1] != ref)        \
     {                                                                         \
+      BITCODE_BL _hvneed = (BITCODE_BL)_obj->numfield + 1;                    \
+      BITCODE_BL _hvcap = 1;                                                  \
+      while (_hvcap < _hvneed)                                                \
+        _hvcap <<= 1;                                                         \
       _obj->hvfield = (BITCODE_H *)realloc (                                  \
-          _obj->hvfield, (_obj->numfield + 1) * sizeof (BITCODE_H));          \
+          _obj->hvfield, _hvcap * sizeof (BITCODE_H));                        \
       _obj->hvfield[_obj->numfield] = ref;                                    \
       LOG_TRACE ("%s[%d] = " FORMAT_REF " [H]\n", #hvfield, _obj->numfield,   \
                  ARGS_REF (_obj->hvfield[_obj->numfield]));                   \

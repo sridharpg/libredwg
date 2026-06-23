@@ -57,6 +57,14 @@ static bool env_var_checked_p;
 #define DWG_LOGLEVEL loglevel
 #include "logging.h"
 
+/* floor-planner patch: when set, dwg_add_handleref skips the handle-ref dedup
+   (ordered_ref_find / ordered_ref_add). Maintaining the sorted ref set is O(n)
+   per ref (sorted-array memmove insert), so bulk-building a document via
+   dwg_add_* was O(n^2). Duplicate refs are harmless for output (they resolve to
+   the same handle), so build_dwg sets this for a near-linear build. Default 0 =
+   stock behavior for decode/import. */
+int libredwg_skip_ref_dedup = 0;
+
 /*------------------------------------------------------------------------------
  * Imports bypassing its headers.
  * We dont want to import in_dxf.h as it is redefining FORMAT_BD.
@@ -2214,7 +2222,7 @@ dwg_add_handleref (Dwg_Data *restrict dwg, const BITCODE_RC code,
                || (obj->fixedtype > DWG_TYPE_GROUP
                    && obj->fixedtype != DWG_TYPE_DICTIONARYVAR)))))
     ;
-  else if (dwg->header.from_version > R_12 || absref)
+  else if ((dwg->header.from_version > R_12 || absref) && !libredwg_skip_ref_dedup)
     {
       // search of this code-absref pair already exists
       // lsearch is slow,use bsearch
@@ -3978,6 +3986,8 @@ void
 ordered_ref_add (Dwg_Data *dwg, Dwg_Object_Ref *ref)
 {
   Dwg_Object_Ref **pBefore = NULL;
+  if (libredwg_skip_ref_dedup) /* floor-planner: skip O(n) sorted insert */
+    return;
   Dwg_Object_Ref **pFound = NULL;
   if (DWG_HDL_OWNER != ref->handleref.code
       && DWG_HDL_SOFTOWN != ref->handleref.code

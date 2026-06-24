@@ -13,6 +13,11 @@
  *   LAYERS <n>
  *     <color> <name:lenstr>             ; n times; color = ACI int or #RRGGBB
  *                                       ; true color (DXF 420)
+ *   BLOCKS <nb>                          ; OPTIONAL — omitted when no spatial
+ *     <name:lenstr> <ne>                 ;   filter. nb block definitions, each
+ *       <TYPE> ...                       ;   holding ne entity records (same
+ *                                        ;   grammar as ENTS). Referenced by
+ *                                        ;   XINSERT below (resolved by name).
  *   ENTS <n>
  *     <TYPE> ...                        ; n records, each:
  *       LINE   <li> <aci> x1 y1 x2 y2
@@ -27,6 +32,12 @@
  *       HATCHP <li> <aci> <name:lenstr> <ndef>
  *                [<angleDeg> bx by ox oy <ndash> <dash>*ndash]*ndef
  *                <nloops> [<npts> (x y)*npts]*nloops   ; patterned (line) fill
+ *       XINSERT <li> <aci> <block:lenstr> x y sx sy rotdeg <nclip> (x y)*nclip
+ *                                       ; block reference (INSERT) carrying an
+ *                                       ; AutoCAD XCLIP. nclip>=3 attaches a
+ *                                       ; SPATIAL_FILTER with the clip polygon
+ *                                       ; (the floor outline). nclip=0 = a plain
+ *                                       ; INSERT. Mirrors the DXF spatial filter.
  *       DIM    <li> <aci> x1 y1 x2 y2 tx ty meas attach rotdeg <text:lenstr>
  *                                       ; rotated/linear DIMENSION: (x1,y1)/(x2,y2)
  *                                       ; = extension-line origins, (tx,ty) =
@@ -55,6 +66,7 @@
 
 #define DEG2RAD(x) ((x) * M_PI / 180.0)
 #define MAX_LAYERS 4096
+#define MAX_BLOCKS 100000
 
 /* Skip libredwg's handle-ref dedup while bulk-building (it's O(n) per ref →
    O(n²) overall). Defined in dwg.c. Duplicate refs are valid for output. */
@@ -144,6 +156,254 @@ static void set_common (Dwg_Data *dwg, void *ent, Dwg_Object_Ref *layer_ref, Col
   }
 }
 
+/* Parse and add ONE entity record into `hdr` (model space or a block header).
+   The record is  <TYPE> <li> <color> <type-specific fields...>.  Shared by the
+   top-level ENTS loop and the per-block BLOCKS loop so both speak the same
+   entity grammar. Returns 1 on success, 0 on clean end-of-stream (no token
+   left), -1 on a parse error (also sets c->err). */
+static int parse_entity (Cur *c, Dwg_Data *dwg, Dwg_Object_BLOCK_HEADER *hdr,
+                         Dwg_Object_Ref **layer_refs, long nlayers) {
+  char t[32];
+  if (tok (c, t, sizeof t) == 0) return 0;
+  int li = (int) tok_int (c);
+  Color col = tok_color (c);
+  Dwg_Object_Ref *lref = (li >= 0 && li < nlayers) ? layer_refs[li] : NULL;
+
+  if (!strcmp (t, "LINE")) {
+    dwg_point_3d p1, p2;
+    p1.x = tok_dbl (c); p1.y = tok_dbl (c); p1.z = 0;
+    p2.x = tok_dbl (c); p2.y = tok_dbl (c); p2.z = 0;
+    Dwg_Entity_LINE *e = dwg_add_LINE (hdr, &p1, &p2);
+    set_common (dwg, e, lref, col);
+  }
+  else if (!strcmp (t, "PLINE")) {
+    int closed = (int) tok_int (c);
+    long npts = tok_int (c);
+    if (npts < 2 || npts > 1000000) { c->err = 1; return -1; }
+    dwg_point_2d *pts = (dwg_point_2d *) malloc (sizeof (dwg_point_2d) * npts);
+    double *bulges = (double *) malloc (sizeof (double) * npts);
+    int has_bulge = 0;
+    for (long k = 0; k < npts; k++) {
+      pts[k].x = tok_dbl (c); pts[k].y = tok_dbl (c);
+      double b = tok_dbl (c); /* trailing per-vertex bulge (DXF 42) */
+      if (bulges) { bulges[k] = b; if (b != 0.0) has_bulge = 1; }
+    }
+    Dwg_Entity_LWPOLYLINE *pl = dwg_add_LWPOLYLINE (hdr, (int) npts, pts);
+    if (pl && closed) pl->flag |= 512;
+    if (pl && has_bulge) {
+      pl->bulges = bulges;
+      pl->num_bulges = (BITCODE_BL) npts;
+      pl->flag |= 16;
+      bulges = NULL; /* ownership transferred to the entity */
+    }
+    set_common (dwg, pl, lref, col);
+    free (pts);
+    free (bulges); /* NULL after ownership transfer; else our temp */
+  }
+  else if (!strcmp (t, "HATCH")) {
+    long nloops = tok_int (c);
+    if (nloops < 1 || nloops > 100000) { c->err = 1; return -1; }
+    const Dwg_Object **objs =
+        (const Dwg_Object **) malloc (sizeof (Dwg_Object *) * nloops);
+    unsigned nobjs = 0;
+    for (long lp = 0; lp < nloops && !c->err; lp++) {
+      long npts = tok_int (c);
+      if (npts < 3 || npts > 1000000) { c->err = 1; break; }
+      dwg_point_2d *pts = (dwg_point_2d *) malloc (sizeof (dwg_point_2d) * npts);
+      for (long k = 0; k < npts; k++) { pts[k].x = tok_dbl (c); pts[k].y = tok_dbl (c); }
+      Dwg_Entity_LWPOLYLINE *pl = dwg_add_LWPOLYLINE (hdr, (int) npts, pts);
+      free (pts);
+      if (pl) {
+        pl->flag |= 512; /* closed boundary loop */
+        set_common (dwg, pl, lref, col);
+        int err = 0;
+        const Dwg_Object *o = dwg_obj_generic_to_object (pl, &err);
+        if (!err && o && objs) { objs[nobjs++] = o; }
+      }
+    }
+    if (!c->err && objs && nobjs > 0) {
+      Dwg_Entity_HATCH *h = dwg_add_HATCH (hdr, 1, "SOLID", false, nobjs, objs);
+      if (h) {
+        h->style = 0; /* normal (even-odd): inner loops render as holes */
+        set_common (dwg, h, lref, col);
+      }
+    }
+    free (objs);
+  }
+  else if (!strcmp (t, "HATCHP")) {
+    char *pname = tok_lenstr (c);
+    long ndef = tok_int (c);
+    if (ndef < 0 || ndef > 10000) { c->err = 1; free (pname); return -1; }
+    Dwg_HATCH_DefLine *defs = (Dwg_HATCH_DefLine *)
+        calloc (ndef > 0 ? ndef : 1, sizeof (Dwg_HATCH_DefLine));
+    for (long d = 0; d < ndef && !c->err; d++) {
+      defs[d].angle = DEG2RAD (tok_dbl (c));
+      defs[d].pt0.x = tok_dbl (c); defs[d].pt0.y = tok_dbl (c);
+      defs[d].offset.x = tok_dbl (c); defs[d].offset.y = tok_dbl (c);
+      long nd = tok_int (c);
+      if (nd < 0 || nd > 1000) { c->err = 1; break; }
+      defs[d].num_dashes = (BITCODE_BS) nd;
+      if (nd > 0) {
+        defs[d].dashes = (double *) malloc (sizeof (double) * nd);
+        for (long k = 0; k < nd; k++) { defs[d].dashes[k] = tok_dbl (c); }
+      }
+    }
+    long nloops = c->err ? 0 : tok_int (c);
+    if (!c->err && (nloops < 1 || nloops > 100000)) { c->err = 1; }
+    const Dwg_Object **objs = (const Dwg_Object **)
+        malloc (sizeof (Dwg_Object *) * (nloops > 0 ? nloops : 1));
+    unsigned nobjs = 0;
+    for (long lp = 0; lp < nloops && !c->err; lp++) {
+      long npts = tok_int (c);
+      if (npts < 3 || npts > 1000000) { c->err = 1; break; }
+      dwg_point_2d *pts = (dwg_point_2d *) malloc (sizeof (dwg_point_2d) * npts);
+      for (long k = 0; k < npts; k++) { pts[k].x = tok_dbl (c); pts[k].y = tok_dbl (c); }
+      Dwg_Entity_LWPOLYLINE *pl = dwg_add_LWPOLYLINE (hdr, (int) npts, pts);
+      free (pts);
+      if (pl) {
+        pl->flag |= 512;
+        set_common (dwg, pl, lref, col);
+        int err = 0;
+        const Dwg_Object *o = dwg_obj_generic_to_object (pl, &err);
+        if (!err && o && objs) { objs[nobjs++] = o; }
+      }
+    }
+    if (!c->err && objs && nobjs > 0) {
+      Dwg_Entity_HATCH *h = dwg_add_HATCH (
+          hdr, 1, (pname && *pname) ? pname : "ANSI31", false, nobjs, objs);
+      if (h) {
+        if (ndef > 0) {
+          h->num_deflines = (BITCODE_BS) ndef;
+          h->deflines = defs;
+          for (long d = 0; d < ndef; d++) { h->deflines[d].parent = h; }
+          defs = NULL; /* ownership transferred to the entity */
+        }
+        set_common (dwg, h, lref, col);
+      }
+    }
+    if (defs) { for (long d = 0; d < ndef; d++) { free (defs[d].dashes); } free (defs); }
+    free (objs);
+    free (pname);
+  }
+  else if (!strcmp (t, "CIRCLE")) {
+    dwg_point_3d ctr; ctr.x = tok_dbl (c); ctr.y = tok_dbl (c); ctr.z = 0;
+    double r = tok_dbl (c);
+    Dwg_Entity_CIRCLE *e = dwg_add_CIRCLE (hdr, &ctr, r);
+    set_common (dwg, e, lref, col);
+  }
+  else if (!strcmp (t, "ARC")) {
+    dwg_point_3d ctr; ctr.x = tok_dbl (c); ctr.y = tok_dbl (c); ctr.z = 0;
+    double r = tok_dbl (c), a0 = tok_dbl (c), a1 = tok_dbl (c);
+    Dwg_Entity_ARC *e = dwg_add_ARC (hdr, &ctr, r, DEG2RAD (a0), DEG2RAD (a1));
+    set_common (dwg, e, lref, col);
+  }
+  else if (!strcmp (t, "TEXT")) {
+    dwg_point_3d ins; ins.x = tok_dbl (c); ins.y = tok_dbl (c); ins.z = 0;
+    double h = tok_dbl (c), rot = tok_dbl (c);
+    int ha = (int) tok_int (c), va = (int) tok_int (c);
+    char *s = tok_lenstr (c);
+    Dwg_Entity_TEXT *e = dwg_add_TEXT (hdr, s ? s : "", &ins, h);
+    free (s);
+    if (e) {
+      e->width_factor = 1.0;
+      e->rotation = DEG2RAD (rot);
+      e->horiz_alignment = (BITCODE_BS) ha;
+      e->vert_alignment = (BITCODE_BS) va;
+      if (ha || va) { e->alignment_pt.x = ins.x; e->alignment_pt.y = ins.y; }
+    }
+    set_common (dwg, e, lref, col);
+  }
+  else if (!strcmp (t, "MTEXT")) {
+    dwg_point_3d ins; ins.x = tok_dbl (c); ins.y = tok_dbl (c); ins.z = 0;
+    double h = tok_dbl (c), w = tok_dbl (c), rot = tok_dbl (c);
+    int att = (int) tok_int (c);
+    char *s = tok_lenstr (c);
+    Dwg_Entity_MTEXT *e = dwg_add_MTEXT (hdr, &ins, w, s ? s : "");
+    free (s);
+    if (e) {
+      if (h > 0) e->text_height = h;
+      if (att >= 1 && att <= 9) e->attachment = (BITCODE_BS) att;
+      e->x_axis_dir.x = cos (DEG2RAD (rot));
+      e->x_axis_dir.y = sin (DEG2RAD (rot));
+      e->x_axis_dir.z = 0;
+    }
+    set_common (dwg, e, lref, col);
+  }
+  else if (!strcmp (t, "DIM")) {
+    dwg_point_3d x1, x2, tm;
+    x1.x = tok_dbl (c); x1.y = tok_dbl (c); x1.z = 0;
+    x2.x = tok_dbl (c); x2.y = tok_dbl (c); x2.z = 0;
+    tm.x = tok_dbl (c); tm.y = tok_dbl (c); tm.z = 0;
+    double meas = tok_dbl (c);
+    int att = (int) tok_int (c);
+    double rot = DEG2RAD (tok_dbl (c));
+    while (rot > M_PI) rot -= 2.0 * M_PI;
+    while (rot < -M_PI) rot += 2.0 * M_PI;
+    char *s = tok_lenstr (c);
+    Dwg_Entity_DIMENSION_LINEAR *e
+        = dwg_add_DIMENSION_LINEAR (hdr, &x1, &x2, &tm, rot);
+    if (e) {
+      e->text_midpt.x = tm.x; e->text_midpt.y = tm.y;
+      e->act_measurement = meas;
+      if (att >= 1 && att <= 9) e->attachment = (BITCODE_BS) att;
+      if (s && *s) e->user_text = strdup (s);
+    }
+    free (s);
+    set_common (dwg, e, lref, col);
+  }
+  else if (!strcmp (t, "XINSERT")) {
+    /* XINSERT <li> <color> <block:lenstr> x y sx sy rotdeg <nclip> (x y)*nclip
+       A block reference (INSERT) at model-space level that carries an AutoCAD
+       XCLIP (SPATIAL_FILTER). nclip>=3 attaches the clip polygon. The floor
+       exporter uses this to clip a per-layer FLOOR_CLIP_* block to the floor
+       outline — the direct-DWG mirror of the DXF INSERT-with-SPATIAL_FILTER. */
+    char *bname = tok_lenstr (c);
+    dwg_point_3d ins; ins.x = tok_dbl (c); ins.y = tok_dbl (c); ins.z = 0;
+    double sx = tok_dbl (c), sy = tok_dbl (c), rotdeg = tok_dbl (c);
+    long nclip = tok_int (c);
+    if (nclip < 0 || nclip > 1000000) { c->err = 1; free (bname); return -1; }
+    dwg_point_2d *cv = NULL;
+    if (nclip > 0) {
+      cv = (dwg_point_2d *) malloc (sizeof (dwg_point_2d) * nclip);
+      for (long k = 0; k < nclip; k++) { cv[k].x = tok_dbl (c); cv[k].y = tok_dbl (c); }
+    }
+    if (!c->err && bname && *bname) {
+      Dwg_Entity_INSERT *ie = dwg_add_INSERT (
+          hdr, &ins, bname, sx != 0.0 ? sx : 1.0, sy != 0.0 ? sy : 1.0, 1.0,
+          DEG2RAD (rotdeg));
+      set_common (dwg, ie, lref, col);
+      if (ie && cv && nclip >= 3) {
+        /* dwg_add_SPATIAL_FILTER builds the INSERT's ACAD_XDICTIONARY ->
+           ACAD_FILTER -> SPATIAL chain and an identity transform; we fill in
+           the clip polygon + world-aligned plane it leaves empty. */
+        Dwg_Object_SPATIAL_FILTER *sf = dwg_add_SPATIAL_FILTER (ie);
+        if (sf) {
+          sf->clip_verts = (BITCODE_2RD *) calloc ((size_t) nclip, sizeof (BITCODE_2RD));
+          if (sf->clip_verts) {
+            for (long k = 0; k < nclip; k++) {
+              sf->clip_verts[k].x = cv[k].x; sf->clip_verts[k].y = cv[k].y;
+            }
+            sf->num_clip_verts = (BITCODE_BS) nclip;
+          }
+          sf->extrusion.x = 0.0; sf->extrusion.y = 0.0; sf->extrusion.z = 1.0;
+          sf->origin.x = 0.0; sf->origin.y = 0.0; sf->origin.z = 0.0;
+          sf->display_boundary_on = 1;
+          sf->front_clip_on = 0;
+          sf->back_clip_on = 0;
+        }
+      }
+    }
+    free (cv);
+    free (bname);
+  }
+  else {
+    /* unknown record type — bail rather than desync the stream */
+    c->err = 1;
+    return -1;
+  }
+  return c->err ? -1 : 1;
+}
+
 int build_dwg (const char *in_path, const char *out_path, const char *version) {
   /* read description file */
   FILE *f = fopen (in_path, "rb");
@@ -223,246 +483,38 @@ int build_dwg (const char *in_path, const char *out_path, const char *version) {
     }
   }
 
-  /* ---- entities ---- */
-  tok (&c, kw, sizeof kw);                 /* ENTS */
+  /* ---- blocks (optional) ----
+     A FLOOR_CLIP_<LAYER> block per layer when the floor carries a spatial
+     filter; each is referenced below by an XINSERT that carries the XCLIP.
+     The section is optional, so non-clip exports stream LAYERS -> ENTS with a
+     description byte-identical to before. dwg_add_INSERT later resolves blocks
+     by name, so they must be defined before the entities that reference them
+     (which the BLOCKS-before-ENTS ordering guarantees). */
+  tok (&c, kw, sizeof kw);                 /* "BLOCKS" or "ENTS" */
+  if (!c.err && !strcmp (kw, "BLOCKS")) {
+    long nblocks = tok_int (&c);
+    if (nblocks < 0 || nblocks > MAX_BLOCKS) { c.err = 1; }
+    for (long b = 0; b < nblocks && !c.err; b++) {
+      char *bname = tok_lenstr (&c);
+      long bents = tok_int (&c);
+      if (c.err || !bname || !*bname) { free (bname); c.err = 1; break; }
+      Dwg_Object_BLOCK_HEADER *bhdr = dwg_add_BLOCK_HEADER (dwg, bname);
+      if (bhdr) { dwg_add_BLOCK (bhdr, bname); }
+      for (long e = 0; e < bents && !c.err; e++) {
+        if (parse_entity (&c, dwg, bhdr ? bhdr : hdr, layer_refs, nlayers) <= 0) { break; }
+      }
+      if (bhdr) { dwg_add_ENDBLK (bhdr); }
+      free (bname);
+    }
+    tok (&c, kw, sizeof kw);               /* now the "ENTS" keyword */
+  }
+
+  /* ---- entities ----
+     kw holds the "ENTS" keyword (read just above, with or without a preceding
+     BLOCKS section). XINSERT records here reference the FLOOR_CLIP_* blocks. */
   long nents = tok_int (&c);
   for (long i = 0; i < nents && !c.err; i++) {
-    char t[32];
-    if (tok (&c, t, sizeof t) == 0) break;
-    int li = (int) tok_int (&c);
-    Color col = tok_color (&c);
-    Dwg_Object_Ref *lref = (li >= 0 && li < nlayers) ? layer_refs[li] : NULL;
-
-    if (!strcmp (t, "LINE")) {
-      dwg_point_3d p1, p2;
-      p1.x = tok_dbl (&c); p1.y = tok_dbl (&c); p1.z = 0;
-      p2.x = tok_dbl (&c); p2.y = tok_dbl (&c); p2.z = 0;
-      Dwg_Entity_LINE *e = dwg_add_LINE (hdr, &p1, &p2);
-      set_common (dwg, e, lref, col);
-    }
-    else if (!strcmp (t, "PLINE")) {
-      int closed = (int) tok_int (&c);
-      long npts = tok_int (&c);
-      if (npts < 2 || npts > 1000000) { c.err = 1; break; }
-      dwg_point_2d *pts = (dwg_point_2d *) malloc (sizeof (dwg_point_2d) * npts);
-      double *bulges = (double *) malloc (sizeof (double) * npts);
-      int has_bulge = 0;
-      for (long k = 0; k < npts; k++) {
-        pts[k].x = tok_dbl (&c); pts[k].y = tok_dbl (&c);
-        double b = tok_dbl (&c); /* trailing per-vertex bulge (DXF 42) */
-        if (bulges) { bulges[k] = b; if (b != 0.0) has_bulge = 1; }
-      }
-      Dwg_Entity_LWPOLYLINE *pl = dwg_add_LWPOLYLINE (hdr, (int) npts, pts);
-      if (pl && closed) pl->flag |= 512;
-      if (pl && has_bulge) {
-        /* Attach the bulge vector so curved segments (rounded corners, arcs)
-           survive instead of flattening to chords. flag 16 = bulges present;
-           dwg_free releases pl->bulges with the entity. */
-        pl->bulges = bulges;
-        pl->num_bulges = (BITCODE_BL) npts;
-        pl->flag |= 16;
-        bulges = NULL; /* ownership transferred to the entity */
-      }
-      set_common (dwg, pl, lref, col);
-      free (pts);
-      free (bulges); /* NULL after ownership transfer; else our temp */
-    }
-    else if (!strcmp (t, "HATCH")) {
-      /* HATCH <li> <color> <nloops> [<npts> (x y)*npts]*nloops
-         loop 0 = outer boundary; loops 1+ = islands (holes, e.g. the counters
-         of letters) — left UNFILLED by the normal (even-odd) hatch style so
-         filled glyphs keep their open inner regions. */
-      long nloops = tok_int (&c);
-      if (nloops < 1 || nloops > 100000) { c.err = 1; break; }
-      const Dwg_Object **objs =
-          (const Dwg_Object **) malloc (sizeof (Dwg_Object *) * nloops);
-      unsigned nobjs = 0;
-      for (long lp = 0; lp < nloops && !c.err; lp++) {
-        long npts = tok_int (&c);
-        if (npts < 3 || npts > 1000000) { c.err = 1; break; }
-        dwg_point_2d *pts = (dwg_point_2d *) malloc (sizeof (dwg_point_2d) * npts);
-        for (long k = 0; k < npts; k++) { pts[k].x = tok_dbl (&c); pts[k].y = tok_dbl (&c); }
-        Dwg_Entity_LWPOLYLINE *pl = dwg_add_LWPOLYLINE (hdr, (int) npts, pts);
-        free (pts);
-        if (pl) {
-          pl->flag |= 512; /* closed boundary loop */
-          set_common (dwg, pl, lref, col);
-          int err = 0;
-          const Dwg_Object *o = dwg_obj_generic_to_object (pl, &err);
-          if (!err && o && objs) { objs[nobjs++] = o; }
-        }
-      }
-      if (!c.err && objs && nobjs > 0) {
-        Dwg_Entity_HATCH *h = dwg_add_HATCH (hdr, 1, "SOLID", false, nobjs, objs);
-        if (h) {
-          h->style = 0; /* normal (even-odd): inner loops render as holes */
-          set_common (dwg, h, lref, col);
-        }
-      }
-      free (objs);
-    }
-    else if (!strcmp (t, "HATCHP")) {
-      /* HATCHP <li> <color> <name:lenstr> <ndef>
-       *          [<angleDeg> bx by ox oy <ndash> <dash>*ndash]*ndef
-       *          <nloops> [<npts> (x y)*npts]*nloops
-       * A patterned (non-solid) hatch: the deflines carry the pattern's line
-       * family (angle, base, offset, dashes) so the fill renders as the actual
-       * line pattern (e.g. diagonal hatching) instead of solid or empty. */
-      char *pname = tok_lenstr (&c);
-      long ndef = tok_int (&c);
-      if (ndef < 0 || ndef > 10000) { c.err = 1; free (pname); break; }
-      Dwg_HATCH_DefLine *defs = (Dwg_HATCH_DefLine *)
-          calloc (ndef > 0 ? ndef : 1, sizeof (Dwg_HATCH_DefLine));
-      for (long d = 0; d < ndef && !c.err; d++) {
-        defs[d].angle = DEG2RAD (tok_dbl (&c));
-        defs[d].pt0.x = tok_dbl (&c); defs[d].pt0.y = tok_dbl (&c);
-        defs[d].offset.x = tok_dbl (&c); defs[d].offset.y = tok_dbl (&c);
-        long nd = tok_int (&c);
-        if (nd < 0 || nd > 1000) { c.err = 1; break; }
-        defs[d].num_dashes = (BITCODE_BS) nd;
-        if (nd > 0) {
-          defs[d].dashes = (double *) malloc (sizeof (double) * nd);
-          for (long k = 0; k < nd; k++) { defs[d].dashes[k] = tok_dbl (&c); }
-        }
-      }
-      long nloops = c.err ? 0 : tok_int (&c);
-      if (!c.err && (nloops < 1 || nloops > 100000)) { c.err = 1; }
-      const Dwg_Object **objs = (const Dwg_Object **)
-          malloc (sizeof (Dwg_Object *) * (nloops > 0 ? nloops : 1));
-      unsigned nobjs = 0;
-      for (long lp = 0; lp < nloops && !c.err; lp++) {
-        long npts = tok_int (&c);
-        if (npts < 3 || npts > 1000000) { c.err = 1; break; }
-        dwg_point_2d *pts = (dwg_point_2d *) malloc (sizeof (dwg_point_2d) * npts);
-        for (long k = 0; k < npts; k++) { pts[k].x = tok_dbl (&c); pts[k].y = tok_dbl (&c); }
-        Dwg_Entity_LWPOLYLINE *pl = dwg_add_LWPOLYLINE (hdr, (int) npts, pts);
-        free (pts);
-        if (pl) {
-          pl->flag |= 512;
-          set_common (dwg, pl, lref, col);
-          int err = 0;
-          const Dwg_Object *o = dwg_obj_generic_to_object (pl, &err);
-          if (!err && o && objs) { objs[nobjs++] = o; }
-        }
-      }
-      if (!c.err && objs && nobjs > 0) {
-        /* non-"SOLID" name => patterned hatch (is_solid_fill stays 0) */
-        Dwg_Entity_HATCH *h = dwg_add_HATCH (
-            hdr, 1, (pname && *pname) ? pname : "ANSI31", false, nobjs, objs);
-        if (h) {
-          if (ndef > 0) {
-            h->num_deflines = (BITCODE_BS) ndef;
-            h->deflines = defs;
-            for (long d = 0; d < ndef; d++) { h->deflines[d].parent = h; }
-            defs = NULL; /* ownership transferred to the entity */
-          }
-          set_common (dwg, h, lref, col);
-        }
-      }
-      if (defs) { for (long d = 0; d < ndef; d++) { free (defs[d].dashes); } free (defs); }
-      free (objs);
-      free (pname);
-    }
-    else if (!strcmp (t, "CIRCLE")) {
-      dwg_point_3d ctr; ctr.x = tok_dbl (&c); ctr.y = tok_dbl (&c); ctr.z = 0;
-      double r = tok_dbl (&c);
-      Dwg_Entity_CIRCLE *e = dwg_add_CIRCLE (hdr, &ctr, r);
-      set_common (dwg, e, lref, col);
-    }
-    else if (!strcmp (t, "ARC")) {
-      dwg_point_3d ctr; ctr.x = tok_dbl (&c); ctr.y = tok_dbl (&c); ctr.z = 0;
-      double r = tok_dbl (&c), a0 = tok_dbl (&c), a1 = tok_dbl (&c);
-      Dwg_Entity_ARC *e = dwg_add_ARC (hdr, &ctr, r, DEG2RAD (a0), DEG2RAD (a1));
-      set_common (dwg, e, lref, col);
-    }
-    else if (!strcmp (t, "TEXT")) {
-      dwg_point_3d ins; ins.x = tok_dbl (&c); ins.y = tok_dbl (&c); ins.z = 0;
-      double h = tok_dbl (&c), rot = tok_dbl (&c);
-      int ha = (int) tok_int (&c), va = (int) tok_int (&c);
-      char *s = tok_lenstr (&c);
-      Dwg_Entity_TEXT *e = dwg_add_TEXT (hdr, s ? s : "", &ins, h);
-      free (s);
-      if (e) {
-        /* dwg_add_TEXT leaves width_factor (DXF 41) at 0, which AutoCAD audits
-           as "width not in range" (zero-width text). 1.0 is the normal value. */
-        e->width_factor = 1.0;
-        e->rotation = DEG2RAD (rot);
-        e->horiz_alignment = (BITCODE_BS) ha;
-        e->vert_alignment = (BITCODE_BS) va;
-        if (ha || va) { e->alignment_pt.x = ins.x; e->alignment_pt.y = ins.y; }
-      }
-      set_common (dwg, e, lref, col);
-    }
-    else if (!strcmp (t, "MTEXT")) {
-      dwg_point_3d ins; ins.x = tok_dbl (&c); ins.y = tok_dbl (&c); ins.z = 0;
-      double h = tok_dbl (&c), w = tok_dbl (&c), rot = tok_dbl (&c);
-      int att = (int) tok_int (&c);
-      char *s = tok_lenstr (&c);
-      Dwg_Entity_MTEXT *e = dwg_add_MTEXT (hdr, &ins, w, s ? s : "");
-      free (s);
-      if (e) {
-        if (h > 0) e->text_height = h;
-        /* attachment point (DXF 71): which of the 9 anchor positions the ins_pt
-           denotes. dwg_add_MTEXT defaults to 1 (top-left); honor the real one. */
-        if (att >= 1 && att <= 9) e->attachment = (BITCODE_BS) att;
-        /* MTEXT rotation is the x-axis direction vector (DXF 11), not a code 50
-           angle — this is what LibreDWG's DXF reader rejected. Encoding it
-           directly here sidesteps that entirely. */
-        e->x_axis_dir.x = cos (DEG2RAD (rot));
-        e->x_axis_dir.y = sin (DEG2RAD (rot));
-        e->x_axis_dir.z = 0;
-      }
-      set_common (dwg, e, lref, col);
-    }
-    else if (!strcmp (t, "DIM")) {
-      /* DIM <li> <color> x1 y1 x2 y2 tx ty meas attach rotdeg <text:lenstr>
-         A rotated/linear DIMENSION: (x1,y1)/(x2,y2) are the two extension-line
-         origins, (tx,ty) is the text + dimension-line point, meas is the
-         measured length (DXF 42), attach is the text attachment (DXF 71, 1..9),
-         rotdeg is the dimension-line angle in degrees (DXF 50), and text is the
-         override label shown verbatim (DXF 1).
-         The angle is the editor's dimension orientation: a horizontal/vertical/
-         oblique dimension whose two measured points are not themselves parallel
-         to that orientation must keep the orientation. dwg_add_DIMENSION_ALIGNED
-         can't express that (it derives the angle from x1->x2), so use
-         dwg_add_DIMENSION_LINEAR, which carries an explicit dim_rotation — this
-         matches the DXF writer's AcDbRotatedDimension (group 50). It ensures a
-         Standard DIMSTYLE and links its handle (via DIMENSION_DEFAULTS), so
-         there is no dangling dimstyle ref. No anonymous *D graphics block is
-         baked — the CAD app regenerates the drawing from the definition. */
-      dwg_point_3d x1, x2, tm;
-      x1.x = tok_dbl (&c); x1.y = tok_dbl (&c); x1.z = 0;
-      x2.x = tok_dbl (&c); x2.y = tok_dbl (&c); x2.z = 0;
-      tm.x = tok_dbl (&c); tm.y = tok_dbl (&c); tm.z = 0;
-      double meas = tok_dbl (&c);
-      int att = (int) tok_int (&c);
-      double rot = DEG2RAD (tok_dbl (&c));
-      /* normalize to [-PI, PI]: dwg_add_DIMENSION_LINEAR rejects |rot| > 12. */
-      while (rot > M_PI) rot -= 2.0 * M_PI;
-      while (rot < -M_PI) rot += 2.0 * M_PI;
-      char *s = tok_lenstr (&c);
-      /* (tx,ty) is the dimension-line definition point (4th arg): the dim line
-         runs through it at `rot`, with extension lines dropped from x1/x2. */
-      Dwg_Entity_DIMENSION_LINEAR *e
-          = dwg_add_DIMENSION_LINEAR (hdr, &x1, &x2, &tm, rot);
-      if (e) {
-        /* text point (DXF 11) on the dim-line point (matches the DXF writer,
-           which sets 10 = 11 = text position). def_pt (DXF 10) is already set
-           to tm by the constructor. */
-        e->text_midpt.x = tm.x; e->text_midpt.y = tm.y;
-        e->act_measurement = meas;
-        if (att >= 1 && att <= 9) e->attachment = (BITCODE_BS) att;
-        /* override text (DXF 1) shown verbatim; dwg_free releases the T string. */
-        if (s && *s) e->user_text = strdup (s);
-      }
-      free (s);
-      set_common (dwg, e, lref, col);
-    }
-    else {
-      /* unknown record type — bail rather than desync the stream */
-      c.err = 1;
-      break;
-    }
+    if (parse_entity (&c, dwg, hdr, layer_refs, nlayers) <= 0) { break; }
   }
 
   int parse_err = c.err;

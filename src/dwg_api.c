@@ -30937,6 +30937,12 @@ dwg_add_SPATIAL_FILTER (
 
     ins->tio.entity->xdicobjhandle
         = dwg_add_handleref (dwg, 3, filter->handle.value, ins);
+    /* dwg_add_entity_defaults set is_xdic_missing=1 on the fresh INSERT. At
+       R_2004a+ the encoder (ENT_XDICOBJHANDLE) only writes the extension-
+       dictionary handle (DXF 360) when is_xdic_missing==0, so without clearing
+       it the whole ACAD_FILTER->SPATIAL->SPATIAL_FILTER chain is orphaned and
+       AutoCAD shows no XCLIP. Clear it now that the INSERT owns an xdictionary. */
+    ins->tio.entity->is_xdic_missing = 0;
 
     _spatial = dwg_add_DICTIONARY (dwg, NULL, "SPATIAL", 0);
     _spatial->is_hardowner = 1;
@@ -30955,9 +30961,26 @@ dwg_add_SPATIAL_FILTER (
         = dwg_add_handleref (dwg, 5, spatial->handle.value, obj);
     add_obj_reactor (obj->tio.object, spatial->handle.value);
     // TODO normal -> matrix
-    _obj->transform[0] = 1.0;
-    _obj->transform[5] = 1.0;
-    _obj->transform[10] = 1.0;
+    // transform/inverse_transform are BITCODE_BD* (NULL after the calloc in
+    // ADD_OBJECT). The encoder always writes 12 doubles for each
+    // (FIELD_VECTOR_N (..., BD, 12, 40) in dwg2.spec), and the identity writes
+    // below dereference them, so they must be allocated first — otherwise this
+    // is a NULL deref (the reason this builder was never exercised). Allocate
+    // both as 12-element identity matrices. Callers fill clip_verts afterwards.
+    _obj->inverse_transform = (BITCODE_BD *)calloc (12, sizeof (BITCODE_BD));
+    _obj->transform = (BITCODE_BD *)calloc (12, sizeof (BITCODE_BD));
+    if (_obj->inverse_transform)
+      {
+        _obj->inverse_transform[0] = 1.0;
+        _obj->inverse_transform[5] = 1.0;
+        _obj->inverse_transform[10] = 1.0;
+      }
+    if (_obj->transform)
+      {
+        _obj->transform[0] = 1.0;
+        _obj->transform[5] = 1.0;
+        _obj->transform[10] = 1.0;
+      }
     return _obj;
   }
 }

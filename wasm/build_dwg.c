@@ -13,6 +13,11 @@
  *   LAYERS <n>
  *     <color> <name:lenstr>             ; n times; color = ACI int or #RRGGBB
  *                                       ; true color (DXF 420)
+ *   EXTENTS minx miny maxx maxy          ; OPTIONAL — plan bounding box (CAD
+ *                                        ; space). Sets EXTMIN/EXTMAX + the
+ *                                        ; *Active VPORT view so CAD viewers
+ *                                        ; zoom-to-fit on open. Omitted = keep
+ *                                        ; libredwg's defaults (plan opens tiny).
  *   BLOCKS <nb>                          ; OPTIONAL — omitted when no spatial
  *     <name:lenstr> <ne>                 ;   filter. nb block definitions, each
  *       <TYPE> ...                       ;   holding ne entity records (same
@@ -404,6 +409,47 @@ static int parse_entity (Cur *c, Dwg_Data *dwg, Dwg_Object_BLOCK_HEADER *hdr,
   return c->err ? -1 : 1;
 }
 
+/* Frame the drawing on a 2D bounding box so CAD viewers zoom-to-fit on open.
+   dwg_new_Document seeds EXTMIN/EXTMAX with the empty sentinel (+/-1e20) and the
+   *Active VPORT with a fixed view unrelated to the model, so a freshly built DWG
+   opens with the plan tiny/off-screen. We overwrite both: EXTMIN/EXTMAX (and
+   LIMMIN/LIMMAX) stay exact for viewers that zoom-to-extents, while the active
+   VPORT view is centered on the bbox and sized to the LARGER plan dimension
+   (+10% margin) so the whole plan stays visible whatever the viewer window's
+   aspect ratio. */
+static void apply_extents (Dwg_Data *dwg, double minx, double miny,
+                           double maxx, double maxy) {
+  if (!(maxx >= minx) || !(maxy >= miny)) return; /* degenerate / NaN guard */
+  double cx = (minx + maxx) / 2.0;
+  double cy = (miny + maxy) / 2.0;
+  double w = maxx - minx; if (!(w > 0)) w = 1.0;
+  double h = maxy - miny; if (!(h > 0)) h = 1.0;
+  double view = (w > h ? w : h) * 1.1; /* max dimension + margin = guaranteed fit */
+
+  dwg->header_vars.EXTMIN.x = minx; dwg->header_vars.EXTMIN.y = miny; dwg->header_vars.EXTMIN.z = 0.0;
+  dwg->header_vars.EXTMAX.x = maxx; dwg->header_vars.EXTMAX.y = maxy; dwg->header_vars.EXTMAX.z = 0.0;
+  dwg->header_vars.LIMMIN.x = minx; dwg->header_vars.LIMMIN.y = miny;
+  dwg->header_vars.LIMMAX.x = maxx; dwg->header_vars.LIMMAX.y = maxy;
+  dwg->header_vars.VIEWCTR.x = cx; dwg->header_vars.VIEWCTR.y = cy; dwg->header_vars.VIEWCTR.z = 0.0;
+  dwg->header_vars.VIEWSIZE = view;
+
+  /* A fresh document carries exactly one VPORT (*Active). Frame it on the plan
+     so viewers that restore the saved view (rather than zoom-to-extents) also
+     open centered. view_width == VIEWSIZE (aspect 1.0) keeps the framing square
+     so no edge is clipped regardless of the viewer's window proportions. */
+  for (BITCODE_BL i = 0; i < dwg->num_objects; i++) {
+    Dwg_Object *obj = &dwg->object[i];
+    if (obj->fixedtype != DWG_TYPE_VPORT) continue;
+    if (!obj->tio.object || !obj->tio.object->tio.VPORT) continue;
+    Dwg_Object_VPORT *vp = obj->tio.object->tio.VPORT;
+    vp->VIEWCTR.x = cx;
+    vp->VIEWCTR.y = cy;
+    vp->VIEWSIZE = view;
+    vp->view_width = view;
+    vp->aspect_ratio = 1.0;
+  }
+}
+
 int build_dwg (const char *in_path, const char *out_path, const char *version) {
   /* read description file */
   FILE *f = fopen (in_path, "rb");
@@ -490,7 +536,20 @@ int build_dwg (const char *in_path, const char *out_path, const char *version) {
      description byte-identical to before. dwg_add_INSERT later resolves blocks
      by name, so they must be defined before the entities that reference them
      (which the BLOCKS-before-ENTS ordering guarantees). */
-  tok (&c, kw, sizeof kw);                 /* "BLOCKS" or "ENTS" */
+  /* ---- extents (optional) ----
+     Sets the drawing extents + active viewport so CAD viewers frame the plan on
+     open (see apply_extents). The keyword is peeked, so exports without a bbox
+     stream LAYERS -> BLOCKS/ENTS exactly as before. */
+  int have_ext = 0;
+  double ext_minx = 0, ext_miny = 0, ext_maxx = 0, ext_maxy = 0;
+  tok (&c, kw, sizeof kw);                 /* "EXTENTS", "BLOCKS", or "ENTS" */
+  if (!c.err && !strcmp (kw, "EXTENTS")) {
+    ext_minx = tok_dbl (&c); ext_miny = tok_dbl (&c);
+    ext_maxx = tok_dbl (&c); ext_maxy = tok_dbl (&c);
+    have_ext = 1;
+    tok (&c, kw, sizeof kw);               /* now "BLOCKS" or "ENTS" */
+  }
+
   if (!c.err && !strcmp (kw, "BLOCKS")) {
     long nblocks = tok_int (&c);
     if (nblocks < 0 || nblocks > MAX_BLOCKS) { c.err = 1; }
@@ -521,6 +580,8 @@ int build_dwg (const char *in_path, const char *out_path, const char *version) {
   free (layer_refs);
   free (buf);
   if (parse_err) { libredwg_skip_ref_dedup = 0; dwg_free (dwg); return 20; }
+
+  if (have_ext) { apply_extents (dwg, ext_minx, ext_miny, ext_maxx, ext_maxy); }
 
   int werr = dwg_write_file (out_path, dwg);
   libredwg_skip_ref_dedup = 0;

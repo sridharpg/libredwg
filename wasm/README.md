@@ -16,6 +16,9 @@ in distinct blocks and rejects some valid DXF, e.g. MTEXT code 50).
 - `tests/` — Node post-build checks (load `wasm/dist/`):
   - `verify-dimension.mjs` — aligned DIMENSION round-trips with its override text.
   - `verify-color.mjs` — layer/entity true color (420) + MTEXT attach/pos survive.
+  - `verify-extents.mjs` — the optional EXTENTS record sets EXTMIN/EXTMAX +
+    the *Active VPORT view (so CAD viewers zoom-to-fit on open); no-EXTENTS path
+    still builds.
   - `test-build.mjs` — exports present; LINE/PLINE/CIRCLE/ARC/TEXT/MTEXT round-trip.
   - `test-scale.mjs N` — build N booths; reports build_dwg wall time (O(n²) check).
   - `test-import-parity.mjs file.dwg` — DWG→DXF import diff vs a reference module.

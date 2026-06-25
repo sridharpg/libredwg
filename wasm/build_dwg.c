@@ -10,6 +10,13 @@
  *
  *   DWGADD1
  *   VER <token>                         ; r2000 etc.
+ *   UNITS <insunits> <measurement>      ; OPTIONAL — sets $INSUNITS (DXF unit
+ *                                       ; code: 1=in 2=ft 4=mm 6=m …) and
+ *                                       ; $MEASUREMENT (0=English 1=metric).
+ *                                       ; Peeked between VER and LAYERS; omitted
+ *                                       ; = keep the document default (mm/metric).
+ *                                       ; Keeps the declared unit consistent with
+ *                                       ; the coordinates so a re-import matches.
  *   LAYERS <n>
  *     <color> <name:lenstr>             ; n times; color = ACI int or #RRGGBB
  *                                       ; true color (DXF 420)
@@ -485,8 +492,24 @@ int build_dwg (const char *in_path, const char *out_path, const char *version) {
   if (!cont_ltype) cont_ltype = dwg_find_tablehandle (dwg, (char *)"ByLayer", (char *)"LTYPE");
   BITCODE_RLL cont_ltype_ref = cont_ltype ? cont_ltype->absolute_ref : 0;
 
+  /* ---- units (optional) ----
+     dwg_new_Document seeded $INSUNITS=4 (mm) + $MEASUREMENT=1 (metric) above.
+     Override both from the export's UNITS record so the declared unit matches the
+     unit the coordinates are written in (otherwise feet/inch geometry shipped
+     under an mm header and re-imports drifted ~25–305×). The keyword is peeked, so
+     a stream without UNITS streams VER -> LAYERS exactly as before. */
+  tok (&c, kw, sizeof kw);                 /* "UNITS" or "LAYERS" */
+  if (!c.err && !strcmp (kw, "UNITS")) {
+    long insunits = tok_int (&c);
+    long measurement = tok_int (&c);
+    if (insunits >= 0 && insunits <= 20)
+      dwg->header_vars.INSUNITS = (BITCODE_BS) insunits;
+    dwg->header_vars.MEASUREMENT = (BITCODE_BS) (measurement ? 1 : 0);
+    tok (&c, kw, sizeof kw);               /* now "LAYERS" */
+  }
+
   /* ---- layers ---- */
-  tok (&c, kw, sizeof kw);                 /* LAYERS */
+  if (strcmp (kw, "LAYERS")) { free (buf); return 13; }
   long nlayers = tok_int (&c);
   if (nlayers < 0 || nlayers > MAX_LAYERS) { free (buf); return 13; }
   Dwg_Object_Ref **layer_refs = (Dwg_Object_Ref **) calloc (nlayers > 0 ? nlayers : 1, sizeof (void *));

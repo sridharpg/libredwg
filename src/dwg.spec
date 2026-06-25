@@ -123,8 +123,19 @@ DWG_ENTITY (TEXT)
         FIELD_RD (height, 40);
         FIELD_T (text_value, 1);
       } else {
-        if (!(dataflags & 0x02))
+        if (!(dataflags & 0x02)) {
           FIELD_2DD (alignment_pt, ins_pt, 0);
+        }
+#ifdef IS_DECODER
+        else {
+          /* dataflags bit 0x02 means "alignment_pt omitted because it equals
+             ins_pt" (the encoder's optimization). Restore it to ins_pt rather
+             than leaving it (0,0), else justified/aligned text (72/73 != 0)
+             decodes its alignment point at the origin and draws at (0,0). */
+          FIELD_VALUE (alignment_pt).x = FIELD_VALUE (ins_pt).x;
+          FIELD_VALUE (alignment_pt).y = FIELD_VALUE (ins_pt).y;
+        }
+#endif
         FIELD_BE (extrusion, 0);
         FIELD_BT (thickness, 0);
       }
@@ -297,8 +308,19 @@ DWG_ENTITY (ATTRIB)
         FIELD_RD (height, 40);
         FIELD_T (text_value, 1);
       } else {
-        if (!(dataflags & 0x02))
+        if (!(dataflags & 0x02)) {
           FIELD_2DD (alignment_pt, ins_pt, 0);
+        }
+#ifdef IS_DECODER
+        else {
+          /* dataflags bit 0x02 means "alignment_pt omitted because it equals
+             ins_pt" (the encoder's optimization). Restore it to ins_pt rather
+             than leaving it (0,0), else justified/aligned text (72/73 != 0)
+             decodes its alignment point at the origin and draws at (0,0). */
+          FIELD_VALUE (alignment_pt).x = FIELD_VALUE (ins_pt).x;
+          FIELD_VALUE (alignment_pt).y = FIELD_VALUE (ins_pt).y;
+        }
+#endif
         FIELD_BE (extrusion, 0);
         FIELD_BT (thickness, 0);
       }

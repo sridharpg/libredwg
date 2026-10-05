@@ -150,14 +150,14 @@ DWG_OBJECT (SORTENTSTABLE)
 
   SUBCLASS (AcDbSortentsTable)
   FIELD_BL (num_ents, 0);
-  VALUEOUTOFBOUNDS (num_ents, 50000)
+  VALUEOUTOFBOUNDS (num_ents, 1000000)
   // read these code 0 handles from the normal stream
   str_dat = hdl_dat; hdl_dat = dat;
   HANDLE_VECTOR (sort_ents, num_ents, 0, 0);
   hdl_dat = str_dat;
 
   START_OBJECT_HANDLE_STREAM;
-  FIELD_HANDLE (block_owner, 4, 0); // mspace or pspace
+  FIELD_HANDLE (block_owner, 4, 330); // model space, paper space, or block
   HANDLE_VECTOR_N (ents, FIELD_VALUE (num_ents), 4, 0);
 
   DXF {

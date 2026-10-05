@@ -67,6 +67,8 @@
 #include <dwg_api.h>
 #include "bits.h"
 #include "out_dxf.h"
+#include "encode.h"
+#include "decode.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,6 +85,58 @@
 /* Skip libredwg's handle-ref dedup while bulk-building (it's O(n) per ref →
    O(n²) overall). Defined in dwg.c. Duplicate refs are valid for output. */
 extern int libredwg_skip_ref_dedup;
+extern void dwg_set_next_objhandle (Dwg_Object *obj);
+
+/* Preserve paint order explicitly, including entities inside clipped blocks.
+   Creation handles increase in this builder, so each entity is its own sort key. */
+static int add_draw_order (Dwg_Data *dwg, Dwg_Object_BLOCK_HEADER *block)
+{
+  if (!block->num_owned) { return 0; }
+  int error = 0;
+  Dwg_Object *owner = dwg_obj_generic_to_object (block, &error);
+  if (!owner || error) { return 1; }
+  BITCODE_BL owner_index = owner->index;
+  BITCODE_RLL owner_handle = owner->handle.value;
+  Dwg_Object_DICTIONARY *dict = dwg_add_DICTIONARY (dwg, NULL, NULL, 0);
+  if (!dict) { return 1; }
+  Dwg_Object *dict_obj = dwg_obj_generic_to_object (dict, &error);
+  if (!dict_obj || error) { return 1; }
+  BITCODE_RLL dict_handle = dict_obj->handle.value;
+  dict->is_hardowner = 1;
+  dict_obj->tio.object->ownerhandle = dwg_add_handleref (dwg, 4, owner_handle, NULL);
+  owner = &dwg->object[owner_index];
+  owner->tio.object->xdicobjhandle = dwg_add_handleref (dwg, 3, dict_handle, NULL);
+  owner->tio.object->is_xdic_missing = 0;
+
+  if (dwg_require_class (dwg, "SORTENTSTABLE", 13) < 0) { return 1; }
+  BITCODE_BL index = dwg->num_objects;
+  int added = dwg_add_object (dwg);
+  if (added > 0) { return 1; }
+  if (added < 0) { dwg_resolve_objectrefs_silent (dwg); }
+  Dwg_Object *obj = &dwg->object[index];
+  dwg->cur_index++;
+  if (dwg_setup_SORTENTSTABLE (obj)) { return 1; }
+  dwg_encode_get_class (dwg, obj);
+  dwg_set_next_objhandle (obj);
+  in_postprocess_handles (obj);
+  obj->tio.object->ownerhandle = dwg_add_handleref (dwg, 4, dict_handle, NULL);
+  obj->tio.object->is_xdic_missing = 1;
+  dwg_add_DICTIONARY_item (dict, "ACAD_SORTENTS", obj->handle.value);
+
+  Dwg_Object_SORTENTSTABLE *table = obj->tio.object->tio.SORTENTSTABLE;
+  table->num_ents = block->num_owned;
+  table->block_owner = dwg_add_handleref (dwg, 4, owner_handle, NULL);
+  table->ents = calloc (table->num_ents, sizeof (BITCODE_H));
+  table->sort_ents = calloc (table->num_ents, sizeof (BITCODE_H));
+  if (!table->ents || !table->sort_ents) { return 1; }
+  for (BITCODE_BL i = 0; i < table->num_ents; i++) {
+    BITCODE_RLL handle = block->entities[i]->absolute_ref;
+    table->ents[i] = dwg_add_handleref (dwg, 4, handle, NULL);
+    table->sort_ents[i] = dwg_add_handleref (dwg, 0, handle, NULL);
+  }
+  return 0;
+}
+
 
 /* ---- tiny cursor-based tokenizer over the description buffer ---- */
 typedef struct { const char *p; const char *end; int err; } Cur;
@@ -606,6 +660,16 @@ int build_dwg (const char *in_path, const char *out_path, const char *version) {
 
   if (have_ext) { apply_extents (dwg, ext_minx, ext_miny, ext_maxx, ext_maxy); }
 
+  dwg->header_vars.SORTENTS = 127;
+  BITCODE_BL object_count = dwg->num_objects;
+  for (BITCODE_BL i = 0; i < object_count; i++) {
+    if (dwg->object[i].fixedtype == DWG_TYPE_BLOCK_HEADER
+        && add_draw_order (dwg, dwg->object[i].tio.object->tio.BLOCK_HEADER)) {
+      libredwg_skip_ref_dedup = 0;
+      dwg_free (dwg);
+      return 21;
+    }
+  }
   int werr = dwg_write_file (out_path, dwg);
   libredwg_skip_ref_dedup = 0;
   dwg_free (dwg);
